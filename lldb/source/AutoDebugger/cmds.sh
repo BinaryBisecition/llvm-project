@@ -1,0 +1,3 @@
+./auto-lldb "opt -passes=vector-combine -mtriple=aarch64-unknown-linux-gnu neon.ll -S -o neon-post.ll" "opt -passes=vector-combine -mtriple=aarch64-unknown-linux-gnu sve.ll -S -o sve-post.ll" "/local/mnt/workspace/pnirpal/prjs/llvm-project/llvm/lib/Transforms/Vectorize/VectorCombine.cpp:4828" "/local/mnt/workspace/pnirpal/prjs/llvm-project/llvm/lib/Transforms/Vectorize/VectorCombine.cpp:4828"
+
+lldb -- opt -passes=vector-combine -mtriple=aarch64-unknown-linux-gnu sve.ll -S -o sve-post.ll
