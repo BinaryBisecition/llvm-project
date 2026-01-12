@@ -195,6 +195,19 @@ bool hasStoppedAtBreakpoint(LLSession &sess, SBThread &ExThread) {
   }
   return false;
 }
+struct FrameSnapShot {
+  string funcn;
+  string file;
+  int line;
+  vector<string> variables;
+};
+
+static bool isApplicationFileCode(const SBFileSpec &fs) {
+  if (!fs.IsValid())
+    return false;
+  string fnm = fs.GetFilename();
+  return fnm == "Queens.cpp";
+}
 
 static string indent(int d) { return string(d * 2, ' '); }
 
@@ -202,8 +215,7 @@ string stringyFySBValue(SBValue val, uint32_t depth = 0,
                         uint32_t max_depth = 6) {
   if (!val.IsValid())
     return "<invalid>";
-  if (depth > max_depth)
-    return "<max-depth>";
+
   std::ostringstream out;
   const char *name = val.GetName();
   const char *type = val.GetTypeName();
@@ -225,84 +237,144 @@ string stringyFySBValue(SBValue val, uint32_t depth = 0,
   else if (value && *value)
     out << value;
 
-  // size_t nchilds = val.GetNumChildren();
-  // if (nchilds > 0) {
-  //   out << " {\n";
-  //   for (size_t i = 0; i < nchilds; i++) {
-  //     SBValue child = val.GetChildAtIndex((uint32_t)i);
-  //     out << stringyFySBValue(child, depth + 1, max_depth);
-  //   }
-  //   out << indent(depth) << "}";
-  // }
+  if (depth >= max_depth)
+    return out.str();
+
+  size_t nchilds = val.GetNumChildren();
+  if (nchilds > 0) {
+    out << " {\n";
+    for (size_t i = 0; i < nchilds; i++) {
+      SBValue child = val.GetChildAtIndex((uint32_t)i);
+      out << stringyFySBValue(child, depth + 1, max_depth);
+    }
+    out << indent(depth) << "}";
+  }
 
   return out.str();
 }
 
-static string captureFrameSnapshot(SBFrame frame) {
-  std::ostringstream out;
-  out << "Function: "
-      << (frame.GetFunctionName() ? frame.GetFunctionName() : "<unknown>")
-      << "\n";
-  SBLineEntry lineEntry = frame.GetLineEntry();
-  if (lineEntry.IsValid()) {
-    out << "Location: " << lineEntry.GetFileSpec().GetFilename() << ":"
-        << lineEntry.GetLine() << "\n";
+static FrameSnapShot captureFrameSnapshot(SBFrame frame) {
+  FrameSnapShot snap;
+
+  const char *fn = frame.GetFunctionName();
+  snap.funcn = (fn ? fn : "<unknown>");
+
+  SBLineEntry le = frame.GetLineEntry();
+  if (le.IsValid()) {
+    snap.file = le.GetFileSpec().GetFilename();
+    snap.line = le.GetLine();
+  } else {
+    snap.file = "<unknown>";
+    snap.line = -1;
   }
   SBValueList vars =
-      frame.GetVariables(/* args */ true, /* locals */ true, /* statics */ true,
-                         /* in-scope-only*/ true);
+      frame.GetVariables(true /* args */, true /* locals */,
+                         false /* statics */, true /* in scope only*/);
+
   for (int i = 0; i < vars.GetSize(); i++) {
-    SBValue val = vars.GetValueAtIndex(i);
-    out << stringyFySBValue(val) << "\n";
+    SBValue v = vars.GetValueAtIndex(i);
+    // SBDeclaration decl = v.GetDeclaration();
+    // if (!isApplicationFileCode(decl.GetFileSpec()))
+    //   continue;
+    snap.variables.push_back(stringyFySBValue(v));
   }
-  return out.str();
+  return snap;
+}
+
+static void dumpSnapShot(const FrameSnapShot &snap) {
+  cerr << "Function : " << snap.funcn << "\n";
+  cerr << "Location : " << snap.file << ":" << snap.line << "\n";
+  for (auto &v : snap.variables)
+    cerr << v << "\n";
+}
+
+struct StackSig {
+  vector<string> funcs;
+};
+
+static StackSig captureStackSig(SBThread &th) {
+  StackSig sigState;
+
+  for (int i = 0; i < th.GetNumFrames(); i++) {
+    SBFrame f = th.GetFrameAtIndex(i);
+    const char *fnm = f.GetFunctionName();
+    sigState.funcs.push_back((fnm ? fnm : "<unknown>"));
+  }
+
+  return sigState;
+}
+
+static int depthDiff(const StackSig &prev, const StackSig &curr) {
+  return (int)curr.funcs.size() - (int)prev.funcs.size();
 }
 
 static bool runSynchronizedLoop(LLSession &base, LLSession &exp) {
+  if (!base.process.IsValid())
+    return false;
+
+  SBThread thrd = base.process.GetThreadAtIndex(0);
+  if (!thrd.IsValid())
+    return false;
+
+  StackSig prev_stack = captureStackSig(thrd);
+  SBLineEntry prev_line_entry =
+      thrd.GetFrameAtIndex(thrd.GetNumFrames() - 1).GetLineEntry();
+  cerr << "[BASE] Root entry\n";
+  dumpSnapShot(
+      captureFrameSnapshot(thrd.GetFrameAtIndex(thrd.GetNumFrames() - 1)));
 
   while (true) {
-    StateType base_state = base.process.GetState();
-    if (base_state == eStateStopped) {
-      // inspect breakpoint
-      for (uint32_t i = 0; i < base.process.GetNumThreads(); i++) {
-        SBThread th = base.process.GetThreadAtIndex(i);
-        if (hasStoppedAtBreakpoint(base, th)) {
-          cerr << captureFrameSnapshot(th.GetFrameAtIndex(0));
-        }
-      }
-    }
-    if (base_state == eStateCrashed)
-      return false;
+    base.process.Continue();
 
-    if (base_state == eStateExited)
-      cerr << "[Base] exited.\n";
-    else
-      base.process.Continue();
+    StateType state;
+    do {
+      state = base.process.GetState();
+    } while (state == eStateRunning);
 
-    StateType exp_state = exp.process.GetState();
-
-    if (exp_state == eStateStopped) {
-      for (uint32_t i = 0; i < exp.process.GetNumThreads(); i++) {
-        SBThread th = exp.process.GetThreadAtIndex(i);
-        if (hasStoppedAtBreakpoint(exp, th)) {
-          cerr << captureFrameSnapshot(th.GetFrameAtIndex(0));
-        }
-      }
-    }
-
-    if (exp_state == eStateCrashed)
-      return false;
-
-    if (exp_state == eStateExited)
-      cerr << "[Exp] exited.\n";
-    else
-      exp.process.Continue();
-
-    if ((exp_state == eStateExited or exp_state == eStateDetached or
-         exp_state == eStateInvalid) and
-        (base_state == eStateExited or base_state == eStateDetached or
-         base_state == eStateInvalid))
+    if (state == eStateExited) {
+      cerr << "[BASE ] process exited\n";
       return true;
+    } else if (state == eStateCrashed) {
+      cerr << "[BASE ] process crashed\n";
+      return false;
+    } else if (state != eStateStopped)
+      continue;
+
+    thrd = base.process.GetThreadAtIndex(0);
+    if (!thrd.IsValid())
+      continue;
+
+    StackSig currStack = captureStackSig(thrd);
+    int diff = depthDiff(prev_stack, currStack);
+
+    SBFrame currFrame = thrd.GetFrameAtIndex(thrd.GetNumFrames() - 1);
+    SBLineEntry curr_le = currFrame.GetLineEntry();
+
+    // Call detected
+    if (diff == 1) {
+      const string &callee = currStack.funcs.back();
+      cerr << "[BASE] Call -> " << callee << "\n";
+
+      SBFrame callee_frame = thrd.GetFrameAtIndex(thrd.GetNumFrames() - 1);
+      dumpSnapShot(captureFrameSnapshot(callee_frame));
+    } else if (diff < 0) {
+      int returns = -diff;
+      for (int i = 0; i < returns; i++) {
+        const string &retfn = prev_stack.funcs[prev_stack.funcs.size() - 1 - i];
+        cerr << "[BASE] Returns <- " << retfn << "\n";
+      }
+    } else {
+      bool progressed = false;
+      if (curr_le.IsValid() and prev_line_entry.IsValid())
+        progressed = curr_le.GetLine() != prev_line_entry.GetLine();
+      if (progressed) {
+        cerr << "[BASE] Progress in " << currStack.funcs.back() << " at line "
+             << curr_le.GetLine() << "\n";
+      }
+    }
+
+    prev_stack = currStack;
+    prev_line_entry = curr_le;
   }
   return true;
 }
